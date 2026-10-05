@@ -15,6 +15,7 @@ import {
   segmentsToLoops,
   type FeatureMode,
   type Island,
+  type Loop,
   type Pt,
 } from "./geometry.js";
 import { bboxOf, type Layer, type ParsedPrint } from "./parse.js";
@@ -48,6 +49,38 @@ export class Mesh {
     const i = this.verts.length;
     this.verts.push(a, b, c);
     this.tris.push([i, i + 1, i + 2]);
+  }
+
+  /**
+   * Vertical walls accumulated by XY edge, across all layers.
+   *
+   * Two layers whose contours share an XY line emit two quads meeting at one
+   * edge, which leaves that edge used four times. Holding walls until every
+   * layer is emitted lets the pair collapse into one quad spanning both, the
+   * union of two stacked prisms without a general boolean pass.
+   */
+  wallSpans = new Map<string, { ax: number; ay: number; bx: number; by: number; zLo: number; zHi: number }>();
+
+  addWallSpan(ax: number, ay: number, bx: number, by: number, z0: number, z1: number): void {
+    const ka = `${round(ax, 4)},${round(ay, 4)}`;
+    const kb = `${round(bx, 4)},${round(by, 4)}`;
+    const key = ka <= kb ? `${ka}|${kb}` : `${kb}|${ka}`;
+    // Store the endpoints in contour order so the quad faces outward.
+    const span = this.wallSpans.get(key);
+    if (span) {
+      if (z0 < span.zLo) span.zLo = z0;
+      if (z1 > span.zHi) span.zHi = z1;
+    } else {
+      this.wallSpans.set(key, { ax, ay, bx, by, zLo: z0, zHi: z1 });
+    }
+  }
+
+  /** Emit the accumulated walls as quads and clear the buffer. */
+  flushWalls(): void {
+    for (const s of this.wallSpans.values()) {
+      this.addQuad([s.ax, s.ay, s.zLo], [s.bx, s.by, s.zLo], [s.bx, s.by, s.zHi], [s.ax, s.ay, s.zHi]);
+    }
+    this.wallSpans.clear();
   }
 
   /** Edge -> use count, keyed on rounded coordinates. */
@@ -94,6 +127,46 @@ export class Mesh {
       }
     }
     return [...lo, ...hi];
+  }
+
+  /**
+   * Remove triangles with two coincident vertices or a degenerate normal.
+   *
+   * Returns how many were dropped. Repeated contour points (seams, and spurs
+   * where one feature meets another) can produce such triangles; a slicer
+   * refuses the file rather than repairing it.
+   */
+  dropDegenerateTris(areaEps = 1e-10, lenEps = 1e-9): number {
+    const before = this.tris.length;
+    const keep: Array<[number, number, number]> = [];
+    for (const [a, b, c] of this.tris) {
+      const pa = this.verts[a];
+      const pb = this.verts[b];
+      const pc = this.verts[c];
+      const ab = Math.hypot(pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]);
+      const bc = Math.hypot(pc[0] - pb[0], pc[1] - pb[1], pc[2] - pb[2]);
+      const ca = Math.hypot(pa[0] - pc[0], pa[1] - pc[1], pa[2] - pc[2]);
+      if (ab <= lenEps || bc <= lenEps || ca <= lenEps) continue;
+      const ux = pb[0] - pa[0], uy = pb[1] - pa[1], uz = pb[2] - pa[2];
+      const vx = pc[0] - pa[0], vy = pc[1] - pa[1], vz = pc[2] - pa[2];
+      const nx = uy * vz - uz * vy;
+      const ny = uz * vx - ux * vz;
+      const nz = ux * vy - uy * vx;
+      if (Math.hypot(nx, ny, nz) * 0.5 <= areaEps) continue;
+      keep.push([a, b, c]);
+    }
+    this.tris = keep;
+    return before - keep.length;
+  }
+
+  /** Compact the vertex list to only those referenced by a triangle. */
+  compact(): number {
+    const used = [...new Set(this.tris.flat())].sort((a, b) => a - b);
+    const remap = new Map<number, number>();
+    used.forEach((oldIdx, newIdx) => remap.set(oldIdx, newIdx));
+    this.verts = used.map((i) => this.verts[i]);
+    this.tris = this.tris.map(([a, b, c]) => [remap.get(a)!, remap.get(b)!, remap.get(c)!]);
+    return this.verts.length;
   }
 
   validate(): Validation {
@@ -410,25 +483,115 @@ function resolveNonManifold(mesh: Mesh): number {
   return fixed;
 }
 
-/** Is this island covered by an island in the adjacent layer? */
-function covered(isl: Island, neighbours: Island[]): boolean {
+/**
+ * Is this XY point inside the material of any island in `neighbours`?
+ *
+ * Used per cap triangle rather than per island: with overlapping islands (the
+ * correct reading of a slice) two islands can each cover part of the other, so
+ * an all-or-nothing test would emit caps into material and leave the shell open.
+ */
+/**
+ * Is every one of these XY points inside the material of `neighbours`?
+ *
+ * Deliberately all-or-nothing. A cap triangle that straddles the neighbour's
+ * boundary counts as NOT covered, so the cap is kept: over-covering leaves a
+ * coincident face inside solid material, which is harmless, whereas
+ * under-covering leaves a strip with no floor and opens the mesh.
+ */
+function insideAny(pts: Array<[number, number]>, neighbours: Island[]): boolean {
   if (neighbours.length === 0) return false;
-  const outer = isl.outer;
-  for (const nb of neighbours) {
-    const cand = nb.outer;
-    const cb = cand.bbox();
-    const ob = outer.bbox();
-    if (ob[0] < cb[0] || ob[1] < cb[1] || ob[2] > cb[2] || ob[3] > cb[3]) continue;
-    let all = true;
-    for (const p of outer.pts) {
-      if (!cand.pointIn(p[0], p[1])) {
-        all = false;
+  for (const [px, py] of pts) {
+    let covered = false;
+    for (const nb of neighbours) {
+      if (!nb.outer.pointIn(px, py)) continue;
+      let inHole = false;
+      for (const h of nb.holes) {
+        if (h.pointIn(px, py)) {
+          inHole = true;
+          break;
+        }
+      }
+      if (!inHole) {
+        covered = true;
         break;
       }
     }
-    if (all) return true;
+    if (!covered) return false;
   }
-  return false;
+  return true;
+}
+
+/**
+ * Do two layers have the same footprint, within `tol`?
+ *
+ * A hash of the boundary lines does not work: the slicer's seam leaves the two
+ * ends of a contour ~0.04 mm apart, so the line sets differ between every pair
+ * of layers even where the wall is perfectly vertical. Compare geometry with a
+ * tolerance instead - same island count, matching areas, and every vertex of
+ * one contour sitting on the other's boundary.
+ */
+function footprintMatches(a: Island[], b: Island[], tol: number): boolean {
+  if (a.length !== b.length) return false;
+  const used = new Array(b.length).fill(false);
+  for (const ia of a) {
+    let matched = -1;
+    for (let j = 0; j < b.length; j++) {
+      if (used[j]) continue;
+      const ib = b[j];
+      if (Math.abs(ia.area() - ib.area()) > tol * 4) continue;
+      if (ia.holes.length !== ib.holes.length) continue;
+      if (contourNear(ia.outer, ib.outer, tol)) {
+        matched = j;
+        break;
+      }
+    }
+    if (matched < 0) return false;
+    used[matched] = true;
+  }
+  return true;
+}
+
+/** Every vertex of `a` lies within `tol` of `b`'s boundary. */
+function contourNear(a: Loop, b: Loop, tol: number): boolean {
+  const bp = b.pts;
+  const n = bp.length;
+  const cell = Math.max(tol, 1e-6);
+  const grid = new Map<string, number[]>();
+  for (let i = 0; i < n; i++) {
+    const k = `${Math.floor(bp[i][0] / cell)},${Math.floor(bp[i][1] / cell)}`;
+    let l = grid.get(k);
+    if (!l) grid.set(k, (l = []));
+    l.push(i);
+  }
+  for (const p of a.pts) {
+    const gx = Math.floor(p[0] / cell);
+    const gy = Math.floor(p[1] / cell);
+    let best = Infinity;
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const l = grid.get(`${gx + dx},${gy + dy}`);
+        if (!l) continue;
+        for (const i of l) {
+          const d = Math.hypot(bp[i][0] - p[0], bp[i][1] - p[1]);
+          if (d < best) best = d;
+        }
+      }
+    }
+    if (best > tol) return false;
+  }
+  return true;
+}
+
+/** A triangle's three vertices, pulled toward its centroid to stay off edges. */
+function triSamples(a: V3, b: V3, c: V3, shrink = 0.85): Array<[number, number]> {
+  const mx = (a[0] + b[0] + c[0]) / 3;
+  const my = (a[1] + b[1] + c[1]) / 3;
+  return [
+    [mx + (a[0] - mx) * shrink, my + (a[1] - my) * shrink],
+    [mx + (b[0] - mx) * shrink, my + (b[1] - my) * shrink],
+    [mx + (c[0] - mx) * shrink, my + (c[1] - my) * shrink],
+    [mx, my],
+  ];
 }
 
 export interface BuildOptions {
@@ -444,6 +607,23 @@ export interface BuildOptions {
   capMode?: "all" | "column";
   /** Give surplus faces their own vertex copies to clear non-manifold edges. */
   splitNonManifold?: boolean;
+  /** Fill leftover open boundary loops so the shell is watertight. */
+  closeHoles?: boolean;
+  /** Merge walls sharing an XY edge into one span across layers. */
+  mergeWalls?: boolean;
+  /**
+   * Tolerance in mm for deciding two layers share a footprint, and so can be
+   * merged into one run. Must exceed the slicer's seam gap (~0.04 mm).
+   */
+  runMatchTol?: number;
+  /**
+   * Drop zero-area and zero-length triangles, which slicers reject outright.
+   *
+   * A contour that visits the same point twice (a seam) can make an ear-clip
+   * emit a triangle with two coincident vertices. Those carry a valid index but
+   * a zero-area normal, and OrcaSlicer treats the file as corrupt.
+   */
+  dropDegenerate?: boolean;
   onProgress?: (layer: number, total: number) => void;
 }
 
@@ -455,6 +635,9 @@ export interface BuildReport {
   loops: number;
   skippedLayers: number;
   weld: { toleranceMm: number; collapsedTriangles: number };
+  degenerateTriangles: number;
+  runs: number;
+  holeFillTriangles: number;
   nonmanifoldSplits: number;
   /**
    * Why the shell is not manifold, when it is not.
@@ -488,6 +671,13 @@ export function buildMesh(parsed: ParsedPrint, opts: BuildOptions = {}): {
   const weldTol = opts.weldTol ?? 0.01;
   const capMode = opts.capMode ?? "all";
   const splitNonManifold = opts.splitNonManifold ?? false;
+  const mergeWalls = opts.mergeWalls ?? false;
+  // Run merging is opt-in. It only pays off on a genuinely vertical wall, and
+  // on a contour that drifts it stretches the first layer's outline across the
+  // whole run, which distorts the model badly. Off by default.
+  const runMatchTol = opts.runMatchTol ?? 0;
+  const dropDegenerate = opts.dropDegenerate ?? true;
+  const closeHoles = opts.closeHoles ?? true;
 
   const report: BuildReport = {
     mode,
@@ -497,6 +687,9 @@ export function buildMesh(parsed: ParsedPrint, opts: BuildOptions = {}): {
     loops: 0,
     skippedLayers: 0,
     weld: { toleranceMm: weldTol, collapsedTriangles: 0 },
+    degenerateTriangles: 0,
+    runs: 0,
+    holeFillTriangles: 0,
     nonmanifoldSplits: 0,
     notes: [],
     validation: {} as Validation,
@@ -539,18 +732,45 @@ export function buildMesh(parsed: ParsedPrint, opts: BuildOptions = {}): {
   for (let idx = 0; idx < traced.length; idx++) {
     const { layer, islands, loops } = traced[idx];
     const z0 = layer.bottom;
-    const z1 = layer.top;
     report.layersUsed++;
     report.islands += islands.length;
     report.loops += loops;
+  }
 
-    const above = idx + 1 < traced.length ? traced[idx + 1].islands : [];
-    const below = idx > 0 ? traced[idx - 1].islands : [];
+  // Group consecutive layers that share a footprint into a run, and build one
+  // shell per run.
+  //
+  // A layer's top cap and the next layer's bottom cap lie in the same plane. If
+  // both are emitted they form an interior face pair, and the wall between them
+  // is drawn twice, leaving every shared edge used four times. Collapsing equal
+  // footprints into a single shell removes those planes outright: the wall spans
+  // the whole run, and caps appear only where the footprint actually changes.
+  const runs: Array<{ from: number; to: number }> = [];
+  for (let i = 0; i < traced.length; i++) {
+    const last = runs[runs.length - 1];
+    if (
+      runMatchTol > 0 &&
+      last &&
+      last.to === i - 1 &&
+      footprintMatches(traced[last.from].islands, traced[i].islands, runMatchTol)
+    ) {
+      last.to = i;
+    } else {
+      runs.push({ from: i, to: i });
+    }
+  }
+  report.runs = runs.length;
+
+  for (let r = 0; r < runs.length; r++) {
+    const { from, to } = runs[r];
+    const bottom = traced[from].layer.bottom;
+    const top = traced[to].layer.top;
+    const islands = traced[from].islands;
 
     for (const isl of islands) {
       const { ring, tris } = triangulate(isl.outer.pts, isl.holes.map((h) => h.pts));
 
-      // side walls
+      // Side walls, spanning the whole run.
       const wallLoops: Array<[Pt[], boolean]> = [[isl.outer.pts, false]];
       for (const h of isl.holes) wallLoops.push([h.pts, true]);
       for (const [pts, reverse] of wallLoops) {
@@ -560,36 +780,36 @@ export function buildMesh(parsed: ParsedPrint, opts: BuildOptions = {}): {
           let ay = pts[k][1];
           let bx = pts[(k + 1) % n][0];
           let by = pts[(k + 1) % n][1];
-          if (reverse) {
-            [ax, ay, bx, by] = [bx, by, ax, ay];
-          }
-          mesh.addQuad([ax, ay, z0], [bx, by, z0], [bx, by, z1], [ax, ay, z1]);
+          if (reverse) [ax, ay, bx, by] = [bx, by, ax, ay];
+          mesh.addQuad([ax, ay, bottom], [bx, by, bottom], [bx, by, top], [ax, ay, top]);
         }
       }
 
-      // caps
-      const covAbove = capMode === "column" ? covered(isl, above) : false;
-      if (!covAbove) {
-        for (const [i0, i1, i2] of tris) {
-          const p0 = ring[i0];
-          const p1 = ring[i1];
-          const p2 = ring[i2];
-          mesh.addTri([p0[0], p0[1], z1], [p1[0], p1[1], z1], [p2[0], p2[1], z1]);
-        }
-      }
-      const covBelow = capMode === "column" ? covered(isl, below) : false;
-      if (!covBelow) {
-        for (const [i0, i1, i2] of tris) {
-          const p0 = ring[i0];
-          const p1 = ring[i1];
-          const p2 = ring[i2];
-          mesh.addTri([p0[0], p0[1], z0], [p2[0], p2[1], z0], [p1[0], p1[1], z0]);
-        }
+      // Caps at both ends of the run, unconditionally.
+      //
+      // Skipping a cap that the neighbouring run appears to cover is what breaks
+      // the shell: two runs with partly overlapping footprints leave the strip
+      // between them with no floor. Emitting both is safe because the two cap
+      // layers are triangulated differently and so share no edges - each stays
+      // internally consistent and every edge is still used exactly twice.
+      for (const [i0, i1, i2] of tris) {
+        const p0 = ring[i0];
+        const p1 = ring[i1];
+        const p2 = ring[i2];
+        mesh.addTri([p0[0], p0[1], top], [p1[0], p1[1], top], [p2[0], p2[1], top]);
+        mesh.addTri([p0[0], p0[1], bottom], [p2[0], p2[1], bottom], [p1[0], p1[1], bottom]);
       }
     }
   }
 
+  report.degenerateTriangles = dropDegenerate ? mesh.dropDegenerateTris() : 0;
+  if (dropDegenerate) mesh.compact();
+  // Fan-fill whatever the caps and walls left open.
+  report.holeFillTriangles = closeHoles ? closeBoundaryHoles(mesh) : 0;
+  if (closeHoles && report.holeFillTriangles > 0) mesh.compact();
   report.weld.collapsedTriangles = weldVertical(mesh, weldTol);
+
+  if (mergeWalls) mesh.flushWalls();
 
   // Optional: clear non-manifold edges by giving the surplus faces their own
   // vertex copies. This does not produce a watertight shell on its own (the new
@@ -631,4 +851,92 @@ export function buildMesh(parsed: ParsedPrint, opts: BuildOptions = {}): {
   report.notes = notes;
 
   return { mesh, report };
+}
+
+
+  /**
+   * Close every open boundary loop with a fan patch.
+   *
+   * Each layer's shell is built from a triangulated cap and side walls built
+   * from the same loops, but the two disagree wherever ear clipping reorders a
+   * ring, so a few edges end up used once. Those edges form closed loops, and a
+   * fan from a centroid vertex gives each edge exactly one partner.
+   */
+function closeBoundaryHoles(mesh: Mesh): number {
+  let added = 0;
+  for (let round = 0; round < 4; round++) {
+    const counts = mesh.edgeCounts();
+    const boundary: Array<[string, string]> = [];
+    for (const [k, c] of counts) {
+    if (c !== 1) continue;
+    const bar = k.indexOf("|");
+    boundary.push([k.slice(0, bar), k.slice(bar + 1)]);
+    }
+    if (boundary.length === 0) break;
+
+    // Chain the open edges into loops through shared endpoints.
+    const byEnd = new Map<string, Array<[string, string]>>();
+    for (const e of boundary) {
+    for (const k of e) {
+      let l = byEnd.get(k);
+      if (!l) byEnd.set(k, (l = []));
+      l.push(e);
+    }
+    }
+    const usedEdge = new Set<string>();
+  const parse = (k: string): [number, number, number] => k.split(",").map(Number) as [number, number, number];
+
+  let progressed = false;
+  for (const seed of boundary) {
+    const seedKey = `${seed[0]}|${seed[1]}`;
+    if (usedEdge.has(seedKey)) continue;
+    const loop: Array<[number, number, number]> = [];
+    let to = seed[1];
+    usedEdge.add(seedKey);
+    let guard = 0;
+    while (guard++ < boundary.length + 4) {
+      loop.push(parse(to));
+      if (to === seed[0]) break;
+      const cands = byEnd.get(to) ?? [];
+      let next: string | null = null;
+      for (const e of cands) {
+        const k = `${e[0]}|${e[1]}`;
+        if (usedEdge.has(k)) continue;
+        next = e[0] === to ? e[1] : e[0];
+        usedEdge.add(k);
+        break;
+      }
+      if (next === null) break;
+      to = next;
+    }
+    // Only a loop that actually returns to its start encloses an area worth
+    // filling. An open chain would patch across a real gap.
+    const closed = loop.length >= 3 && to === seed[0];
+    if (!closed) continue;
+    progressed = true;
+
+    // Fan from a centroid at the loop's mean Z.
+    let cx = 0, cy = 0, cz = 0;
+    for (const p of loop) {
+      cx += p[0];
+      cy += p[1];
+      cz += p[2];
+    }
+    const ci = mesh.verts.length;
+    mesh.verts.push([cx / loop.length, cy / loop.length, cz / loop.length]);
+    const ring = loop.map((p) => {
+      mesh.verts.push([p[0], p[1], p[2]]);
+      return mesh.verts.length - 1;
+    });
+    for (let i = 0; i < ring.length; i++) {
+      const a = ring[i];
+      const b = ring[(i + 1) % ring.length];
+      if (a === ci || b === ci || a === b) continue;
+      mesh.tris.push([ci, a, b]);
+      added++;
+    }
+  }
+  if (!progressed) break;
+  }
+  return added;
 }

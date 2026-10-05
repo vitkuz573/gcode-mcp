@@ -447,13 +447,25 @@ export function segmentsToLoops(segs: Seg[], z: number, opts: LoopOptions = {}):
   return loops;
 }
 
-/** Classify loops into islands (outer) with holes, by nesting containment. */
-export function loopsToIslands(loops: Loop[]): Island[] {
+/**
+ * Classify loops into islands, optionally treating contained loops as holes.
+ *
+ * Nesting alone cannot tell a hole from a second island: an outer wall and the
+ * inner wall one wall-thickness inside it form two concentric contours with
+ * solid material between them, which looks exactly like an outer loop with a
+ * hole. Picking wrong either punches a void into a solid wall or seals a real
+ * cavity shut, so `allowHoles` defaults to false and every contour becomes its
+ * own island. Overlapping islands are the correct reading of a slice: the
+ * material between two walls is solid, and letting the solids overlap matches
+ * that.
+ */
+export function loopsToIslands(loops: Loop[], allowHoles = true): Island[] {
   if (loops.length === 0) return [];
   const items = loops.slice();
   for (const lp of items) {
     if (lp.signedArea() < 0) lp.pts.reverse();
   }
+  // Bigger loops first, so any container is examined before what it contains.
   items.sort((a, b) => b.area() - a.area());
 
   const islands: Island[] = [];
@@ -461,16 +473,20 @@ export function loopsToIslands(loops: Loop[]): Island[] {
   for (const lp of items) {
     const [cx, cy] = lp.centroid();
     let placed = false;
-    for (let k = 0; k < islands.length; k++) {
-      if (islands[k].outer.pointIn(cx, cy)) {
-        holes[k].push(lp);
-        placed = true;
-        break;
+    if (allowHoles) {
+      for (let k = 0; k < islands.length; k++) {
+        if (islands[k].outer.pointIn(cx, cy)) {
+          holes[k].push(lp);
+          placed = true;
+          break;
+        }
       }
     }
     if (!placed) {
-      islands.push(new Island(lp, [], lp.z));
-      holes.push([]);
+      const isl = new Island(lp, [], lp.z);
+      islands.push(isl);
+      // Share the same array, otherwise holes pushed below never reach the island.
+      holes.push(isl.holes);
     }
   }
   return islands;

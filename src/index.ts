@@ -410,18 +410,19 @@ function pickLayers(count: number, spec: string): number[] {
   for (const part of spec.split(",")) {
     const t = part.trim();
     if (!t) continue;
-    const m = /^(\d*)-(\d+)(?:-(\d+))?$/.exec(t);
-    if (m) {
-      const start = m[1] ? parseInt(m[1], 10) : 0;
-      const end = parseInt(m[2], 10);
-      const step = m[3] ? parseInt(m[3], 10) : 1;
-      if (m[1]) {
-        for (let i = end; i <= start; i += step) out.add(i);
-      } else {
-        for (let i = 0; i <= end; i += step) out.add(i);
-      }
-    } else if (/^\d+$/.test(t)) {
-      out.add(parseInt(t, 10));
+    // "start-end" or "start-end-step". With only one number, scan upward from 0.
+    const m = /^(\d*)(?:-(\d+))?(?:-(\d+))?$/.exec(t);
+    if (!m || (!m[1] && !m[2])) continue;
+    const start = m[1] ? parseInt(m[1], 10) : 0;
+    const end = m[2] ? parseInt(m[2], 10) : start;
+    const step = m[3] ? parseInt(m[3], 10) : 1;
+    if (step <= 0) continue;
+    // A start above the end counts down, which is the useful reading for a
+    // top-down sweep; otherwise walk upward from 0.
+    if (m[1] && m[2] && start > end) {
+      for (let i = start; i >= end; i -= step) out.add(i);
+    } else {
+      for (let i = start; i <= end; i += step) out.add(i);
     }
   }
   return [...out].filter((i) => i >= 0 && i < count).sort((a, b) => a - b);
