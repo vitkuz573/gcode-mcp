@@ -15,12 +15,16 @@ Works with OrcaSlicer, AnycubicSlicerNext, PrusaSlicer and Cura gcode.
 ## Install
 
 ```bash
-cd ~/gcode-mcp
+git clone https://github.com/vitkuz573/gcode-mcp.git
+cd gcode-mcp
 npm install
 npm run build
 ```
 
 ## opencode config
+
+Add this to `~/.config/opencode/opencode.jsonc`, adjusting the two paths to
+wherever you cloned the repo:
 
 ```jsonc title="~/.config/opencode/opencode.jsonc"
 {
@@ -29,8 +33,8 @@ npm run build
     "servers": {
       "gcode": {
         "type": "local",
-        "command": ["node", "/home/vitaly/gcode-mcp/dist/index.js"],
-        "cwd": "/home/vitaly/gcode-mcp"
+        "command": ["node", "/path/to/gcode-mcp/dist/index.js"],
+        "cwd": "/path/to/gcode-mcp"
       }
     }
   }
@@ -133,6 +137,8 @@ Verified on a 359-layer, 783k-segment model: 664k triangles, 49.4 cm³, closed,
 4 non-manifold edges, ~7 s single-threaded.
 
 ## Development
+
+Run these from the repo root:
 
 ```bash
 npm run build          # tsc -> dist/
