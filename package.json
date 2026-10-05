@@ -1,0 +1,45 @@
+{
+  "name": "gcode-mcp",
+  "version": "0.1.0",
+  "description": "MCP server to reconstruct 3D models from sliced gcode, inspect gcode, and compare slices",
+  "type": "module",
+  "bin": {
+    "gcode-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "inspect": "npm run build && npx @modelcontextprotocol/inspector node dist/index.js",
+    "bench": "tsc -p tsconfig.tools.json && node dist-tools/tools/probe.js"
+  },
+  "keywords": [
+    "mcp",
+    "gcode",
+    "3mf",
+    "stl",
+    "slicer",
+    "orca",
+    "reverse-engineering"
+  ],
+  "author": "Vitaly Kuzyaev <vitkuz573@gmail.com>",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vitkuz573/gcode-mcp.git"
+  },
+  "homepage": "https://github.com/vitkuz573/gcode-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/vitkuz573/gcode-mcp/issues"
+  }
+}
