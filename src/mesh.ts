@@ -19,6 +19,7 @@ import {
   type Pt,
 } from "./geometry.js";
 import { bboxOf, type Layer, type ParsedPrint } from "./parse.js";
+import { unionAvailable, unionPrisms, type UnionLayer, type UnionRing } from "./union.js";
 import { triangulate } from "./triangulate.js";
 
 export type V3 = [number, number, number];
@@ -617,6 +618,11 @@ export interface BuildOptions {
    */
   runMatchTol?: number;
   /**
+   * Use the exact prism-union boundary (needs shapely). On by default; falls
+   * back to per-layer meshing when the helper is unavailable.
+   */
+  useUnion?: boolean;
+  /**
    * Drop zero-area and zero-length triangles, which slicers reject outright.
    *
    * A contour that visits the same point twice (a seam) can make an ear-clip
@@ -639,6 +645,9 @@ export interface BuildReport {
   runs: number;
   holeFillTriangles: number;
   nonmanifoldSplits: number;
+  /** True when the exact prism union was used rather than per-layer meshing. */
+  union: boolean;
+  unionLayers: number;
   /**
    * Why the shell is not manifold, when it is not.
    *
@@ -676,6 +685,7 @@ export function buildMesh(parsed: ParsedPrint, opts: BuildOptions = {}): {
   // on a contour that drifts it stretches the first layer's outline across the
   // whole run, which distorts the model badly. Off by default.
   const runMatchTol = opts.runMatchTol ?? 0;
+  const useUnion = opts.useUnion ?? true;
   const dropDegenerate = opts.dropDegenerate ?? true;
   const closeHoles = opts.closeHoles ?? true;
 
@@ -691,6 +701,8 @@ export function buildMesh(parsed: ParsedPrint, opts: BuildOptions = {}): {
     runs: 0,
     holeFillTriangles: 0,
     nonmanifoldSplits: 0,
+    union: false,
+    unionLayers: 0,
     notes: [],
     validation: {} as Validation,
     bbox: bboxOf(parsed),
@@ -698,7 +710,7 @@ export function buildMesh(parsed: ParsedPrint, opts: BuildOptions = {}): {
 
   // Pass 1: trace every layer up front, because whether a layer needs a cap
   // depends on its neighbours.
-  const traced: Array<{ layer: Layer; islands: Island[]; loops: number }> = [];
+  const traced: TracedLayer[] = [];
   const source = layerStep > 1 ? parsed.layers.filter((_, i) => i % layerStep === 0) : parsed.layers;
 
   for (let i = 0; i < source.length; i++) {
@@ -737,6 +749,21 @@ export function buildMesh(parsed: ParsedPrint, opts: BuildOptions = {}): {
     report.loops += loops;
   }
 
+interface TracedLayer {
+  layer: Layer;
+  islands: Island[];
+  loops: number;
+}
+
+/**
+ * Per-layer meshing: one closed shell per layer.
+ *
+ * Every layer gets caps and walls, so each is closed on its own and the whole
+ * mesh has no boundary edges. The cost is a coincident cap pair wherever two
+ * layers share a footprint, which leaves a few over-shared edges. Used only
+ * when shapely is unavailable, since the union path is manifold by construction.
+ */
+function emitPerLayer(mesh: Mesh, traced: TracedLayer[], report: BuildReport): void {
   // Group consecutive layers that share a footprint into a run, and build one
   // shell per run.
   //
@@ -745,61 +772,28 @@ export function buildMesh(parsed: ParsedPrint, opts: BuildOptions = {}): {
   // is drawn twice, leaving every shared edge used four times. Collapsing equal
   // footprints into a single shell removes those planes outright: the wall spans
   // the whole run, and caps appear only where the footprint actually changes.
-  const runs: Array<{ from: number; to: number }> = [];
-  for (let i = 0; i < traced.length; i++) {
-    const last = runs[runs.length - 1];
-    if (
-      runMatchTol > 0 &&
-      last &&
-      last.to === i - 1 &&
-      footprintMatches(traced[last.from].islands, traced[i].islands, runMatchTol)
-    ) {
-      last.to = i;
-    } else {
-      runs.push({ from: i, to: i });
+}
+
+  // Preferred path: exact boundary of the union of prisms, via shapely.
+  //
+  // This is the only construction that is manifold by definition. When it is
+  // unavailable the per-layer path below runs instead, which stays watertight
+  // but leaves a few over-shared edges.
+  let unioned = false;
+  if (useUnion) {
+    const u = unionPrisms(
+      traced.map((t) => ({ z0: t.layer.bottom, z1: t.layer.top, islands: t.islands }))
+    );
+    if (u) {
+      unioned = true;
+      emitUnion(mesh, u.layers);
+      report.union = true;
+      report.unionLayers = u.layers.length;
     }
   }
-  report.runs = runs.length;
 
-  for (let r = 0; r < runs.length; r++) {
-    const { from, to } = runs[r];
-    const bottom = traced[from].layer.bottom;
-    const top = traced[to].layer.top;
-    const islands = traced[from].islands;
-
-    for (const isl of islands) {
-      const { ring, tris } = triangulate(isl.outer.pts, isl.holes.map((h) => h.pts));
-
-      // Side walls, spanning the whole run.
-      const wallLoops: Array<[Pt[], boolean]> = [[isl.outer.pts, false]];
-      for (const h of isl.holes) wallLoops.push([h.pts, true]);
-      for (const [pts, reverse] of wallLoops) {
-        const n = pts.length;
-        for (let k = 0; k < n; k++) {
-          let ax = pts[k][0];
-          let ay = pts[k][1];
-          let bx = pts[(k + 1) % n][0];
-          let by = pts[(k + 1) % n][1];
-          if (reverse) [ax, ay, bx, by] = [bx, by, ax, ay];
-          mesh.addQuad([ax, ay, bottom], [bx, by, bottom], [bx, by, top], [ax, ay, top]);
-        }
-      }
-
-      // Caps at both ends of the run, unconditionally.
-      //
-      // Skipping a cap that the neighbouring run appears to cover is what breaks
-      // the shell: two runs with partly overlapping footprints leave the strip
-      // between them with no floor. Emitting both is safe because the two cap
-      // layers are triangulated differently and so share no edges - each stays
-      // internally consistent and every edge is still used exactly twice.
-      for (const [i0, i1, i2] of tris) {
-        const p0 = ring[i0];
-        const p1 = ring[i1];
-        const p2 = ring[i2];
-        mesh.addTri([p0[0], p0[1], top], [p1[0], p1[1], top], [p2[0], p2[1], top]);
-        mesh.addTri([p0[0], p0[1], bottom], [p2[0], p2[1], bottom], [p1[0], p1[1], bottom]);
-      }
-    }
+  if (!unioned) {
+    emitPerLayer(mesh, traced, report);
   }
 
   report.degenerateTriangles = dropDegenerate ? mesh.dropDegenerateTris() : 0;
@@ -939,4 +933,44 @@ function closeBoundaryHoles(mesh: Mesh): number {
   if (!progressed) break;
   }
   return added;
+}
+
+
+/** Mesh the exact prism-union boundary: side walls plus exposed caps only. */
+function emitUnion(mesh: Mesh, layers: UnionLayer[]): void {
+  for (const layer of layers) {
+    const { z0, z1 } = layer;
+    // Side walls: one quad per edge of every ring of the exposed region.
+    for (const poly of layer.side) {
+      for (const ring of [poly.exterior, ...poly.holes]) {
+        const n = ring.length;
+        if (n < 3) continue;
+        const reverse = poly.holes.some((h) => h === ring);
+        for (let k = 0; k < n; k++) {
+          let ax = ring[k][0];
+          let ay = ring[k][1];
+          let bx = ring[(k + 1) % n][0];
+          let by = ring[(k + 1) % n][1];
+          if (reverse) [ax, ay, bx, by] = [bx, by, ax, ay];
+          mesh.addQuad([ax, ay, z0], [bx, by, z0], [bx, by, z1], [ax, ay, z1]);
+        }
+      }
+    }
+    // Caps: only the parts not covered by the neighbouring layer.
+    for (const [polys, z, flip] of [
+      [layer.capBottom, z0, true],
+      [layer.capTop, z1, false],
+    ] as Array<[UnionRing[], number, boolean]>) {
+      for (const poly of polys) {
+        const { ring, tris } = triangulate(poly.exterior, poly.holes);
+        for (const [i0, i1, i2] of tris) {
+          const p0 = ring[i0];
+          const p1 = ring[i1];
+          const p2 = ring[i2];
+          if (flip) mesh.addTri([p0[0], p0[1], z], [p2[0], p2[1], z], [p1[0], p1[1], z]);
+          else mesh.addTri([p0[0], p0[1], z], [p1[0], p1[1], z], [p2[0], p2[1], z]);
+        }
+      }
+    }
+  }
 }

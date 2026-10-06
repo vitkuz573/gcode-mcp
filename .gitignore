@@ -8,3 +8,4 @@ out/
 *.stl
 *.3mf
 *.gcode
+.venv/
