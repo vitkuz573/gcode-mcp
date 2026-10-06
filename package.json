@@ -1,6 +1,6 @@
 {
   "name": "gcode-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server to reconstruct 3D models from sliced gcode, inspect gcode, and compare slices",
   "type": "module",
   "bin": {
