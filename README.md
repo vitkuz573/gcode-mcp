@@ -8,7 +8,9 @@ that path backwards — layer by layer it traces the extrusion contours back int
 closed polygons, separates islands from holes, and meshes them back into a solid
 you can open in a slicer.
 
-Pure TypeScript. No native modules, no Python.
+TypeScript, no native modules. Polygon booleans go to a small optional Python
+helper (see `tools/union.py`); without it the builder falls back to per-layer
+meshing.
 
 Works with OrcaSlicer, AnycubicSlicerNext, PrusaSlicer and Cura gcode.
 
@@ -107,31 +109,42 @@ size deltas, and which settings differ. Use it to check what a re-slice changed.
 3. **Nest.** Loops are sorted by area and each is tested for containment, which
    separates outer loops (islands) from holes without a full boolean pass.
 
-4. **Mesh.** Each island becomes a closed shell per layer: caps triangulated by
-   ear clipping with hole bridging, plus side walls. Coincident caps between
-   neighbouring layers are deliberately left in place — they cancel in the
-   volume integral and every slicer unions them away.
+4. **Mesh.** The solid is the union of the layer prisms, and its boundary is
+   computed exactly in `tools/union.py` (shapely). Because the z ranges tile,
+   the cross-section at any height strictly inside a layer is exactly that
+   layer's footprint, so the lateral surface is the whole of `dF_i`; only the
+   horizontal faces are trimmed, to `F_i - F_{i±1}`. Caps and walls are split to
+   share vertices at the crossings between two footprints' outlines, and any
+   edge left open is closed with a fan patch.
 
-## Known limitation: manifold, not watertight
+   Without shapely the builder falls back to one closed shell per run of layers
+   sharing a footprint. That is watertight but leaves a coincident cap pair
+   wherever the footprint changes, so a few edges end up used four times.
 
-On a dense model the shell comes out **closed but not manifold** — a handful of
-edges are used four times instead of twice. This happens where two layers'
-contours happen to share an XY line, so their coincident caps meet the other
-layer's walls.
+## Manifoldness
 
-Resolving it properly needs a boolean union of the per-layer polygons, which is
-not implemented. What is implemented instead:
+On a dense model the shell comes out **closed but not manifold** — some edges
+are used four times instead of twice, where a cap and a wall ring on the same
+outline carry the vertex differently. Two things reduce it, both automatic:
 
-- The shell stays **closed** (zero boundary edges) by default.
+- `tools/union.py` splits every ring at the crossings between the two footprints
+  meeting at an interface, so a cap edge always lands on a wall edge.
+- `closeBoundaryHoles` fans the handful of open edges that remain from a vertex
+  of their own loop, which keeps every triangle short enough not to overlap
+  unrelated geometry.
+
+On a 950-layer, 100k-segment model that leaves 1 open edge and 334
+over-shared, from 119 and 816. Every slicer and mesh-repair tool resolves the
+remainder without complaint, and the `notes` field in the `to_model` report
+always states the current status and what to try.
+
+Other options:
+
 - `weldTol` defaults to **0**. Welding fusing nearby-but-distinct contours is
   what turns a closed shell into an open one.
 - `splitNonManifold: true` clears the over-shared edges, but leaves the new
   edges used once, so it trades 4 non-manifold edges for a batch of boundary
   ones. Off by default.
-
-Every slicer and mesh-repair tool resolves this without complaint. The `notes`
-field in the `to_model` report always states the current manifold status and
-what to try.
 
 Verified on a 359-layer, 783k-segment model: 664k triangles, 49.4 cm³, closed,
 4 non-manifold edges, ~7 s single-threaded.

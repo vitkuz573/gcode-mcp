@@ -106,6 +106,11 @@ function bridgeHoles(outer: Pt[], holes: Pt[][]): Pt[] {
  * represent that, so the copy it fails to reference shows up later as an open
  * boundary edge. Reducing to one occurrence keeps caps and side walls built
  * from the same vertex set.
+ *
+ * Call this on each ring BEFORE hole bridging, never on the merged ring:
+ * bridging works by duplicating its two bridge vertices, so a dedupe after it
+ * deletes the bridge and turns the hole into a pinch that ear clipping fills
+ * with the wrong area.
  */
 export function dedupeRing(ring: Pt[], tol = 1e-4): Pt[] {
   const seen = new Set<string>();
@@ -150,19 +155,13 @@ function dropDegenerate(idx: number[], ring: Pt[]): number {
   return removed;
 }
 
-function earClip(input: Pt[]): Array<[number, number, number]> {
+const same = (a: Pt, b: Pt): boolean => Math.abs(a[0] - b[0]) <= 1e-9 && Math.abs(a[1] - b[1]) <= 1e-9;
+
+function earClip(input: Pt[]): { ring: Pt[]; tris: Array<[number, number, number]> } {
   let ring = input;
   let n = ring.length;
-  if (n < 3) return [];
+  if (n < 3) return { ring, tris: [] };
   if (signedArea(ring) < 0) ring = [...ring].reverse();
-
-  // A contour can pass through one coordinate twice (a seam, or a spur where
-  // the outer wall meets another feature). Ear clipping cannot represent that,
-  // so collapse repeats up front; otherwise the clip leaves vertices
-  // unreferenced and the cap comes out open.
-  ring = dedupeRing(ring);
-  n = ring.length;
-  if (n < 3) return [];
 
   const idx = [...Array(n).keys()];
   const tris: Array<[number, number, number]> = [];
@@ -185,7 +184,12 @@ function earClip(input: Pt[]): Array<[number, number, number]> {
       let ok = true;
       for (const j of idx) {
         if (j === i0 || j === i1 || j === i2) continue;
-        if (pointInTriangle(ring[j], a, b, c)) {
+        const p = ring[j];
+        // Compare coordinates, not indices: hole bridging duplicates its two
+        // bridge vertices on purpose, and a seam repeats one point. Such a
+        // vertex lies ON the triangle's boundary and must not veto the ear.
+        if (same(p, a) || same(p, b) || same(p, c)) continue;
+        if (pointInTriangle(p, a, b, c)) {
           ok = false;
           break;
         }
@@ -202,15 +206,18 @@ function earClip(input: Pt[]): Array<[number, number, number]> {
     }
   }
   if (idx.length === 3) tris.push([idx[0], idx[1], idx[2]]);
-  return tris;
+  return { ring, tris };
 }
 
-/** Triangulate a polygon with holes. Triangles index into the merged ring. */
+/** Triangulate a polygon with holes. Triangles index into the returned ring. */
 export function triangulate(outer: Pt[], holes: Pt[][] = []): {
   ring: Pt[];
   tris: Array<[number, number, number]>;
 } {
-  const ring = bridgeHoles(outer, holes);
-  const tris = earClip(ring);
+  // Clean each ring on its own, then bridge. See dedupeRing for why the order
+  // matters: a dedupe after bridging would remove the bridge itself.
+  const o = dedupeRing(outer);
+  const hs = holes.map((h) => dedupeRing(h)).filter((h) => h.length >= 3);
+  const { ring, tris } = earClip(bridgeHoles(o, hs));
   return { ring, tris };
 }

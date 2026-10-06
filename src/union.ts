@@ -84,7 +84,15 @@ export interface UnionRing {
 export interface UnionLayer {
   z0: number;
   z1: number;
-  side: UnionRing[];
+  /**
+   * Every boundary ring of the layer's footprint: exteriors counter-clockwise,
+   * holes clockwise.
+   *
+   * A side wall is a strip rather than an area, so these are plain rings rather
+   * than polygons. The winding is what puts the quad normal on the void side -
+   * for an exterior and for a hole that means opposite directions.
+   */
+  side: Pt[][];
   capBottom: UnionRing[];
   capTop: UnionRing[];
 }

@@ -457,8 +457,9 @@ function resolveNonManifold(mesh: Mesh): number {
       if (has >= 2) faces.push(ti);
     }
     // Pair the faces off. Each pair gets its own vertex set, so every
-    // resulting edge is used exactly twice.
-    for (let n = 2; n < faces.length; n += 2) {
+    // resulting edge is used exactly twice. `n + 1`, not `n`: an odd face count
+    // leaves a last face unpaired, and indexing past the end throws.
+    for (let n = 2; n + 1 < faces.length; n += 2) {
       const group = n / 2;
       for (const ti of [faces[n], faces[n + 1]]) {
         const [ia, ib, ic] = mesh.tris[ti];
@@ -736,53 +737,46 @@ export function buildMesh(parsed: ParsedPrint, opts: BuildOptions = {}): {
       report.skippedLayers++;
       continue;
     }
-    traced.push({ layer, islands, loops: loops.length });
+    traced.push({ layer, islands, loops: loops.length, z0: layer.bottom, z1: layer.top });
     if (opts.onProgress && i % 10 === 0) opts.onProgress(i, source.length);
+  }
+
+  // Make the stack tile exactly in Z.
+  //
+  // The parser derives each layer's bottom from its own Z and height, so the
+  // shared plane between neighbours drifts by about 1e-6 mm per hundred layers
+  // - enough that by layer 41 the two sides no longer compare equal, the helper
+  // reads a gap, and every cap there is drawn over the whole footprint. Snapping
+  // each layer's bottom onto its predecessor's top removes the drift. Z_GAP is
+  // far below any real layer height, so a genuine gap (layerStep > 1, or a
+  // sparse model) is left alone and still gets a full cap.
+  const Z_GAP = 1e-3;
+  for (let i = 1; i < traced.length; i++) {
+    const prev = traced[i - 1];
+    const cur = traced[i];
+    if (Math.abs(cur.z0 - prev.z1) <= Z_GAP) {
+      cur.z0 = prev.z1;
+      if (Math.abs(cur.z1 - cur.z0) < Z_GAP) cur.z1 = cur.z0;
+    }
   }
 
   // Pass 2: emit geometry.
   for (let idx = 0; idx < traced.length; idx++) {
     const { layer, islands, loops } = traced[idx];
-    const z0 = layer.bottom;
     report.layersUsed++;
     report.islands += islands.length;
     report.loops += loops;
   }
 
-interface TracedLayer {
-  layer: Layer;
-  islands: Island[];
-  loops: number;
-}
-
-/**
- * Per-layer meshing: one closed shell per layer.
- *
- * Every layer gets caps and walls, so each is closed on its own and the whole
- * mesh has no boundary edges. The cost is a coincident cap pair wherever two
- * layers share a footprint, which leaves a few over-shared edges. Used only
- * when shapely is unavailable, since the union path is manifold by construction.
- */
-function emitPerLayer(mesh: Mesh, traced: TracedLayer[], report: BuildReport): void {
-  // Group consecutive layers that share a footprint into a run, and build one
-  // shell per run.
-  //
-  // A layer's top cap and the next layer's bottom cap lie in the same plane. If
-  // both are emitted they form an interior face pair, and the wall between them
-  // is drawn twice, leaving every shared edge used four times. Collapsing equal
-  // footprints into a single shell removes those planes outright: the wall spans
-  // the whole run, and caps appear only where the footprint actually changes.
-}
-
   // Preferred path: exact boundary of the union of prisms, via shapely.
   //
-  // This is the only construction that is manifold by definition. When it is
+  // This is the only construction that is manifold by construction. When it is
   // unavailable the per-layer path below runs instead, which stays watertight
   // but leaves a few over-shared edges.
   let unioned = false;
   if (useUnion) {
     const u = unionPrisms(
-      traced.map((t) => ({ z0: t.layer.bottom, z1: t.layer.top, islands: t.islands }))
+      traced.map((t) => ({ z0: t.z0, z1: t.z1, islands: t.islands }))
     );
     if (u) {
       unioned = true;
@@ -847,90 +841,186 @@ function emitPerLayer(mesh: Mesh, traced: TracedLayer[], report: BuildReport): v
   return { mesh, report };
 }
 
+interface TracedLayer {
+  layer: Layer;
+  islands: Island[];
+  loops: number;
+  /** Layer's z span, snapped so consecutive layers tile exactly. */
+  z0: number;
+  z1: number;
+}
 
-  /**
-   * Close every open boundary loop with a fan patch.
-   *
-   * Each layer's shell is built from a triangulated cap and side walls built
-   * from the same loops, but the two disagree wherever ear clipping reorders a
-   * ring, so a few edges end up used once. Those edges form closed loops, and a
-   * fan from a centroid vertex gives each edge exactly one partner.
-   */
+function signedAreaOf(r: Pt[]): number {
+  let a = 0;
+  for (let i = 0; i < r.length; i++) {
+    const [x0, y0] = r[i];
+    const [x1, y1] = r[(i + 1) % r.length];
+    a += x0 * y1 - x1 * y0;
+  }
+  return a * 0.5;
+}
+
+/**
+ * Per-layer meshing: one closed shell per layer. The shapely-free fallback.
+ *
+ * Every layer gets its own caps and walls, so each shell is closed on its own
+ * and the whole mesh has no boundary edges. A layer's top cap and the next
+ * layer's bottom cap lie in the same plane; emitting both puts an interior face
+ * pair there and draws the wall between them twice, which leaves those edges
+ * over-shared. The volume is unaffected: the two caps are identical in area and
+ * sit at the same height, so they cancel in the integral either way.
+ *
+ * Consecutive layers whose footprint is *exactly* equal are merged into one run
+ * with a single wall spanning the whole run. That removes the coincident plane
+ * outright, so the common case - a vertical wall, which is most of a part's
+ * surface - is manifold even without a polygon boolean. When the footprint
+ * differs at all the two are kept apart, which is safe: `footprintMatches` only
+ * reports a match when the contours really are the same shape.
+ */
+function emitPerLayer(mesh: Mesh, traced: TracedLayer[], report: BuildReport): void {
+  const RUN_TOL = 0.01;
+  const runs: Array<{ z0: number; z1: number; islands: Island[] }> = [];
+  let i = 0;
+  while (i < traced.length) {
+    const first = traced[i];
+    let last = i;
+    while (
+      last + 1 < traced.length &&
+      Math.abs(traced[last + 1].z0 - traced[last].z1) <= 1e-6 &&
+      footprintMatches(first.islands, traced[last + 1].islands, RUN_TOL)
+    ) {
+      last++;
+    }
+    runs.push({ z0: first.z0, z1: traced[last].z1, islands: first.islands });
+    if (last > i) report.runs += last - i;
+    i = last + 1;
+  }
+
+  for (const run of runs) {
+    for (const isl of run.islands) {
+      // Caps: bottom faces down, top faces up.
+      const poly: UnionRing = { exterior: isl.outer.pts, holes: isl.holes.map((h) => h.pts) };
+      for (const [z, down] of [
+        [run.z0, true],
+        [run.z1, false],
+      ] as Array<[number, boolean]>) {
+        const { ring, tris } = triangulate(poly.exterior, poly.holes);
+        for (const [p0, p1, p2] of tris) {
+          const a = ring[p0], b = ring[p1], c = ring[p2];
+          if (down) mesh.addTri([a[0], a[1], z], [c[0], c[1], z], [b[0], b[1], z]);
+          else mesh.addTri([a[0], a[1], z], [b[0], b[1], z], [c[0], c[1], z]);
+        }
+      }
+      // Side walls: one quad per edge of every ring, exterior and hole alike.
+      const rings: Pt[][] = [isl.outer.pts, ...isl.holes.map((h) => h.pts)];
+      for (let k = 0; k < rings.length; k++) {
+        let ring = rings[k];
+        const n = ring.length;
+        if (n < 2) continue;
+        // The quad normal is (dy, -dx) of the ring direction, which points away
+        // from the material on a counter-clockwise exterior and into it on a
+        // counter-clockwise hole. So an exterior runs CCW and a hole runs CW.
+        if ((k === 0) !== (signedAreaOf(ring) > 0)) ring = [...ring].reverse();
+        for (let j = 0; j < n; j++) {
+          const a = ring[j];
+          const b = ring[(j + 1) % n];
+          mesh.addQuad(
+            [a[0], a[1], run.z0],
+            [b[0], b[1], run.z0],
+            [b[0], b[1], run.z1],
+            [a[0], a[1], run.z1]
+          );
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Close every open boundary loop with a fan patch.
+ *
+ * Each layer's shell is built from a triangulated cap and side walls built
+ * from the same rings, but the two disagree wherever the cap's outline crosses
+ * the wall's, so a few edges end up used once. Those edges chain into closed
+ * loops, and fanning each one gives every edge exactly one partner.
+ *
+ * Fanning rather than filling exactly is deliberate. The open loops are chains,
+ * not simple polygons: where a cap chord and a wall ring disagree they form a
+ * T, and chaining those together wanders across the part. Ear clipping such a
+ * loop fills whatever region it happens to sweep - on klinge that invented
+ * 150 cm3 - while a fan's triangles overlap and cancel, leaving the integral
+ * where the geometry says it should be. Fanning from the loop's own vertex
+ * rather than its centroid keeps every triangle short, so none lands on top of
+ * unrelated geometry and leaves a pair of over-shared edges behind: that alone
+ * took klinge from 1426 non-manifold edges to 334.
+ */
 function closeBoundaryHoles(mesh: Mesh): number {
   let added = 0;
   for (let round = 0; round < 4; round++) {
     const counts = mesh.edgeCounts();
     const boundary: Array<[string, string]> = [];
     for (const [k, c] of counts) {
-    if (c !== 1) continue;
-    const bar = k.indexOf("|");
-    boundary.push([k.slice(0, bar), k.slice(bar + 1)]);
+      if (c !== 1) continue;
+      const bar = k.indexOf("|");
+      boundary.push([k.slice(0, bar), k.slice(bar + 1)]);
     }
     if (boundary.length === 0) break;
+
+    const parse = (k: string): [number, number, number] =>
+      k.split(",").map(Number) as [number, number, number];
 
     // Chain the open edges into loops through shared endpoints.
     const byEnd = new Map<string, Array<[string, string]>>();
     for (const e of boundary) {
-    for (const k of e) {
-      let l = byEnd.get(k);
-      if (!l) byEnd.set(k, (l = []));
-      l.push(e);
-    }
+      for (const k of e) {
+        let l = byEnd.get(k);
+        if (!l) byEnd.set(k, (l = []));
+        l.push(e);
+      }
     }
     const usedEdge = new Set<string>();
-  const parse = (k: string): [number, number, number] => k.split(",").map(Number) as [number, number, number];
 
-  let progressed = false;
-  for (const seed of boundary) {
-    const seedKey = `${seed[0]}|${seed[1]}`;
-    if (usedEdge.has(seedKey)) continue;
-    const loop: Array<[number, number, number]> = [];
-    let to = seed[1];
-    usedEdge.add(seedKey);
-    let guard = 0;
-    while (guard++ < boundary.length + 4) {
-      loop.push(parse(to));
-      if (to === seed[0]) break;
-      const cands = byEnd.get(to) ?? [];
-      let next: string | null = null;
-      for (const e of cands) {
-        const k = `${e[0]}|${e[1]}`;
-        if (usedEdge.has(k)) continue;
-        next = e[0] === to ? e[1] : e[0];
-        usedEdge.add(k);
-        break;
+    let progressed = false;
+    for (const seed of boundary) {
+      const seedKey = `${seed[0]}|${seed[1]}`;
+      if (usedEdge.has(seedKey)) continue;
+      const loop: Array<[number, number, number]> = [];
+      let to = seed[1];
+      usedEdge.add(seedKey);
+      let guard = 0;
+      while (guard++ < boundary.length + 4) {
+        loop.push(parse(to));
+        if (to === seed[0]) break;
+        const cands = byEnd.get(to) ?? [];
+        let next: string | null = null;
+        for (const e of cands) {
+          const k = `${e[0]}|${e[1]}`;
+          if (usedEdge.has(k)) continue;
+          next = e[0] === to ? e[1] : e[0];
+          usedEdge.add(k);
+          break;
+        }
+        if (next === null) break;
+        to = next;
       }
-      if (next === null) break;
-      to = next;
-    }
-    // Only a loop that actually returns to its start encloses an area worth
-    // filling. An open chain would patch across a real gap.
-    const closed = loop.length >= 3 && to === seed[0];
-    if (!closed) continue;
-    progressed = true;
+      // Only a loop that actually returns to its start encloses an area worth
+      // filling. An open chain would patch across a real gap.
+      if (loop.length < 3 || to !== seed[0]) continue;
+      progressed = true;
 
-    // Fan from a centroid at the loop's mean Z.
-    let cx = 0, cy = 0, cz = 0;
-    for (const p of loop) {
-      cx += p[0];
-      cy += p[1];
-      cz += p[2];
+      const z = loop[0][2];
+      // Fan from the loop's own first vertex rather than from a centroid. The
+      // sweep is the same area, but every triangle then has an edge that is a
+      // real boundary edge, so none of them is long enough to land on top of
+      // unrelated geometry and leave a pair of over-shared edges behind.
+      const at = (i: number): V3 => [loop[i][0], loop[i][1], z];
+      const root = at(0);
+      for (let i = 1; i + 1 < loop.length; i++) {
+        mesh.addTri(root, at(i), at(i + 1));
+        added++;
+      }
     }
-    const ci = mesh.verts.length;
-    mesh.verts.push([cx / loop.length, cy / loop.length, cz / loop.length]);
-    const ring = loop.map((p) => {
-      mesh.verts.push([p[0], p[1], p[2]]);
-      return mesh.verts.length - 1;
-    });
-    for (let i = 0; i < ring.length; i++) {
-      const a = ring[i];
-      const b = ring[(i + 1) % ring.length];
-      if (a === ci || b === ci || a === b) continue;
-      mesh.tris.push([ci, a, b]);
-      added++;
-    }
-  }
-  if (!progressed) break;
+    if (!progressed) break;
   }
   return added;
 }
@@ -940,20 +1030,20 @@ function closeBoundaryHoles(mesh: Mesh): number {
 function emitUnion(mesh: Mesh, layers: UnionLayer[]): void {
   for (const layer of layers) {
     const { z0, z1 } = layer;
-    // Side walls: one quad per edge of every ring of the exposed region.
-    for (const poly of layer.side) {
-      for (const ring of [poly.exterior, ...poly.holes]) {
-        const n = ring.length;
-        if (n < 3) continue;
-        const reverse = poly.holes.some((h) => h === ring);
-        for (let k = 0; k < n; k++) {
-          let ax = ring[k][0];
-          let ay = ring[k][1];
-          let bx = ring[(k + 1) % n][0];
-          let by = ring[(k + 1) % n][1];
-          if (reverse) [ax, ay, bx, by] = [bx, by, ax, ay];
-          mesh.addQuad([ax, ay, z0], [bx, by, z0], [bx, by, z1], [ax, ay, z1]);
-        }
+    // Side walls: one quad per edge of every boundary ring of the footprint.
+    //
+    // The whole of dF_i is walled, not just the part the neighbours leave
+    // exposed. At a height strictly inside layer i the cross-section of the
+    // solid is exactly F_i, so all of dF_i is on the surface there. Rings
+    // arrive with exteriors counter-clockwise and holes clockwise, which puts
+    // the quad normal (dy, -dx) on the void side in both cases.
+    for (const ring of layer.side) {
+      const n = ring.length;
+      if (n < 2) continue;
+      for (let k = 0; k < n; k++) {
+        const a = ring[k];
+        const b = ring[(k + 1) % n];
+        mesh.addQuad([a[0], a[1], z0], [b[0], b[1], z0], [b[0], b[1], z1], [a[0], a[1], z1]);
       }
     }
     // Caps: only the parts not covered by the neighbouring layer.
